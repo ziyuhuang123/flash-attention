@@ -11,7 +11,7 @@ from einops import rearrange, repeat
 from flash_attn.utils.benchmark import benchmark_all, benchmark_forward, benchmark_backward
 from flash_attn.utils.benchmark import benchmark_fwd_bwd, benchmark_combined
 
-from flash_attn import flash_attn_qkvpacked_func
+from flash_attn import flash_attn_qkvpacked_func, flash_attn_with_kvcache
 
 try:
     from triton.ops.flash_attention import attention as attention_triton
@@ -67,14 +67,15 @@ def time_fwd_bwd(func, *args, **kwargs):
     return time_f[1].mean, time_b[1].mean
 
 
-repeats = 30
+repeats = 1
 device = 'cuda'
 dtype = torch.float16
 
-bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
-causal_vals = [False, True]
-headdim_vals = [64, 128]
-dim = 2048
+# bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
+bs_seqlen_vals = [(1, 16384)]
+causal_vals = [False]
+headdim_vals = [128]
+dim = 1024
 dropout_p = 0.0
 
 methods = (["Flash2", "Pytorch"]
@@ -93,87 +94,92 @@ for causal in causal_vals:
         for batch_size, seqlen in bs_seqlen_vals:
             config = (causal, headdim, batch_size, seqlen)
             nheads = dim // headdim
-            qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, device=device, dtype=dtype,
-                              requires_grad=True)
-            f, b = time_fwd_bwd(
-                flash_attn_qkvpacked_func, qkv, dropout_p, causal=causal, repeats=repeats, verbose=False
-            )
-            time_f[config, "Flash2"] = f
-            time_b[config, "Flash2"] = b
+            qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, device=device, dtype=dtype, requires_grad=True)
+            q = qkv[:, :, 0, :, :].clone().requires_grad_(True)  # 查询 (Q)
+            k = qkv[:, :, 1, :, :].clone().requires_grad_(True)  # 键 (K)
+            v = qkv[:, :, 2, :, :].clone().requires_grad_(True)  # 值 (V)
+            # f, b = time_fwd_bwd(
+            #     flash_attn_qkvpacked_func, qkv, dropout_p, causal=causal, repeats=repeats, verbose=False
+            # ) # flash_attn_with_kvcache
 
-            try:
-                qkv = qkv.detach().requires_grad_(True)
-                f, b = time_fwd_bwd(
-                    attention_pytorch, qkv, dropout_p, causal=causal, repeats=repeats, verbose=False
-                )
-            except:  # Skip if OOM
-                f, b = float('nan'), float('nan')
-            time_f[config, "Pytorch"] = f
-            time_b[config, "Pytorch"] = b
+            out = flash_attn_with_kvcache(q, k, v)
 
-            if attention_triton is not None:
-                q, k, v = [torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype,
-                                    requires_grad=True) for _ in range(3)]
-                # Try both values of sequence_parallel and pick the faster one
-                try:
-                    f, b = time_fwd_bwd(
-                        attention_triton, q, k, v, causal, headdim**(-0.5),
-                        False, repeats=repeats, verbose=False
-                    )
-                except:
-                    f, b = float('nan'), float('inf')
-                try:
-                    _, b0 = time_fwd_bwd(
-                        attention_triton, q, k, v, causal, headdim**(-0.5),
-                        True, repeats=repeats, verbose=False
-                    )
-                except:
-                    b0 = float('inf')
-                time_f[config, "Triton"] = f
-                time_b[config, "Triton"] = min(b, b0) if min(b, b0) < float('inf') else float('nan')
+            # time_f[config, "Flash2"] = f
+            # time_b[config, "Flash2"] = b
 
-            if xops is not None:
-                q, k, v = [torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype,
-                                    requires_grad=True) for _ in range(3)]
-                f, b = time_fwd_bwd(
-                    xops.memory_efficient_attention, q, k, v,
-                    attn_bias=xops.LowerTriangularMask() if causal else None,
-                    op=(xops.fmha.cutlass.FwOp, xops.fmha.cutlass.BwOp)
-                )
-                time_f[config, "xformers.c"] = f
-                time_b[config, "xformers.c"] = b
+            # try:
+            #     qkv = qkv.detach().requires_grad_(True)
+            #     f, b = time_fwd_bwd(
+            #         attention_pytorch, qkv, dropout_p, causal=causal, repeats=repeats, verbose=False
+            #     )
+            # except:  # Skip if OOM
+            #     f, b = float('nan'), float('nan')
+            # time_f[config, "Pytorch"] = f
+            # time_b[config, "Pytorch"] = b
 
-            if xops is not None:
-                q, k, v = [torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype,
-                                    requires_grad=True) for _ in range(3)]
-                f, b = time_fwd_bwd(
-                    xops.memory_efficient_attention, q, k, v,
-                    attn_bias=xops.LowerTriangularMask() if causal else None,
-                    op=(xops.fmha.flash.FwOp, xops.fmha.flash.BwOp)
-                )
-                time_f[config, "xformers.f"] = f
-                time_b[config, "xformers.f"] = b
+            # if attention_triton is not None:
+            #     q, k, v = [torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype,
+            #                         requires_grad=True) for _ in range(3)]
+            #     # Try both values of sequence_parallel and pick the faster one
+            #     try:
+            #         f, b = time_fwd_bwd(
+            #             attention_triton, q, k, v, causal, headdim**(-0.5),
+            #             False, repeats=repeats, verbose=False
+            #         )
+            #     except:
+            #         f, b = float('nan'), float('inf')
+            #     try:
+            #         _, b0 = time_fwd_bwd(
+            #             attention_triton, q, k, v, causal, headdim**(-0.5),
+            #             True, repeats=repeats, verbose=False
+            #         )
+            #     except:
+            #         b0 = float('inf')
+            #     time_f[config, "Triton"] = f
+            #     time_b[config, "Triton"] = min(b, b0) if min(b, b0) < float('inf') else float('nan')
 
-            print(f"### causal={causal}, headdim={headdim}, batch_size={batch_size}, seqlen={seqlen} ###")
-            for method in methods:
-                time_f_b[config, method] = time_f[config, method] + time_b[config, method]
-                speed_f[config, method] = efficiency(
-                    flops(batch_size, seqlen, headdim, nheads, causal, mode="fwd"),
-                    time_f[config, method]
-                )
-                speed_b[config, method] = efficiency(
-                    flops(batch_size, seqlen, headdim, nheads, causal, mode="bwd"),
-                    time_b[config, method]
-                )
-                speed_f_b[config, method] = efficiency(
-                    flops(batch_size, seqlen, headdim, nheads, causal, mode="fwd_bwd"),
-                    time_f_b[config, method]
-                )
-                print(
-                    f"{method} fwd: {speed_f[config, method]:.2f} TFLOPs/s, "
-                    f"bwd: {speed_b[config, method]:.2f} TFLOPs/s, "
-                    f"fwd + bwd: {speed_f_b[config, method]:.2f} TFLOPs/s"
-                )
+            # if xops is not None:
+            #     q, k, v = [torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype,
+            #                         requires_grad=True) for _ in range(3)]
+            #     f, b = time_fwd_bwd(
+            #         xops.memory_efficient_attention, q, k, v,
+            #         attn_bias=xops.LowerTriangularMask() if causal else None,
+            #         op=(xops.fmha.cutlass.FwOp, xops.fmha.cutlass.BwOp)
+            #     )
+            #     time_f[config, "xformers.c"] = f
+            #     time_b[config, "xformers.c"] = b
+
+            # if xops is not None:
+            #     q, k, v = [torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype,
+            #                         requires_grad=True) for _ in range(3)]
+            #     f, b = time_fwd_bwd(
+            #         xops.memory_efficient_attention, q, k, v,
+            #         attn_bias=xops.LowerTriangularMask() if causal else None,
+            #         op=(xops.fmha.flash.FwOp, xops.fmha.flash.BwOp)
+            #     )
+            #     time_f[config, "xformers.f"] = f
+            #     time_b[config, "xformers.f"] = b
+
+            # print(f"### causal={causal}, headdim={headdim}, batch_size={batch_size}, seqlen={seqlen} ###")
+            # for method in methods:
+            #     time_f_b[config, method] = time_f[config, method] + time_b[config, method]
+            #     speed_f[config, method] = efficiency(
+            #         flops(batch_size, seqlen, headdim, nheads, causal, mode="fwd"),
+            #         time_f[config, method]
+            #     )
+            #     speed_b[config, method] = efficiency(
+            #         flops(batch_size, seqlen, headdim, nheads, causal, mode="bwd"),
+            #         time_b[config, method]
+            #     )
+            #     speed_f_b[config, method] = efficiency(
+            #         flops(batch_size, seqlen, headdim, nheads, causal, mode="fwd_bwd"),
+            #         time_f_b[config, method]
+            #     )
+            #     print(
+            #         f"{method} fwd: {speed_f[config, method]:.2f} TFLOPs/s, "
+            #         f"bwd: {speed_b[config, method]:.2f} TFLOPs/s, "
+            #         f"fwd + bwd: {speed_f_b[config, method]:.2f} TFLOPs/s"
+            #     )
 
 
 # with open('flash2_attn_time.plk', 'wb') as fp:
